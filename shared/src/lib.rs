@@ -8,6 +8,7 @@ pub mod auth;
 pub mod backfill;
 pub mod batch;
 pub mod batch_retry;
+pub mod bounded_batch;
 pub mod bounded_cache;
 pub mod canonical;
 pub mod chaos;
@@ -17,6 +18,7 @@ pub mod compat;
 pub mod conflict_resolver;
 pub use conflict_resolver::{resolve_conflict_pair, ConflictCandidate, ConflictResolutionResult, ConflictWinner};
 pub mod config;
+pub mod config_audit;
 pub mod config_version;
 pub mod domain_events;
 pub mod dry_run_policy;
@@ -566,3 +568,7 @@ mod test_queue_backpressure;
 mod test_concurrent_replay;
 #[cfg(test)]
 mod test_resumable_repair;
+#[cfg(test)]
+mod test_init_rollback;
+#[cfg(test)]
+mod test_compat_fixtures;

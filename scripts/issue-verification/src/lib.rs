@@ -34,3 +34,17 @@ pub mod resumable_repair;
 #[cfg(test)]
 #[path = "../../../shared/src/test_resumable_repair.rs"]
 mod test_resumable_repair;
+#[path = "../../../shared/src/bounded_batch.rs"]
+pub mod bounded_batch;
+#[path = "../../../shared/src/init_rollback.rs"]
+pub mod init_rollback;
+#[cfg(test)]
+#[path = "../../../shared/src/test_init_rollback.rs"]
+mod test_init_rollback;
+#[path = "../../../shared/src/compat.rs"]
+pub mod compat;
+#[cfg(test)]
+#[path = "../../../shared/src/test_compat_fixtures.rs"]
+mod test_compat_fixtures;
+#[path = "../../../shared/src/config_audit.rs"]
+pub mod config_audit;
