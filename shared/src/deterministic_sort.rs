@@ -1,21 +1,24 @@
-//! Deterministic sorting for mixed-status records and events (Issue #284).
+//! Deterministic sorting for mixed-status records, status digests, and event lists (Issues #284, #492).
 //!
-//! When records and events span multiple lifecycle statuses (`Pending`, `Active`,
+//! When records, statuses, and events span multiple lifecycle statuses (`Pending`, `Active`,
 //! `Failed`, `Paused`, `Settled`, `Cancelled`, `Archived`) and arrive out of
 //! order or share identical timestamps/ledger sequences, naive sorting can
 //! produce unstable or non-deterministic results across nodes and retries.
 //!
 //! This module provides:
 //! - Canonical [`RecordStatus::priority_rank`] ordering for mixed-status datasets.
-//! - Total-order comparators (`compare_records`, `compare_events`) with a strict
-//!   tie-breaking chain (`primary_key -> timestamp -> ledger_seq -> id/tx_index`).
-//! - Bounded, `no_std`-compatible insertion sort (`MAX_SORT_ITEMS`) to prevent
+//! - Total-order comparators (`compare_records`, `compare_events`, `compare_statuses`)
+//!   with strict tie-breaking chains.
+//! - Bounded, `no_std`-compatible insertion sort (`MAX_SORT_ITEMS = 200`) to prevent
 //!   unbounded gas consumption.
+//! - Deterministic event list sorting (`sort_events`) and component status sorting (`sort_statuses`).
 //! - Visibility- and authorization-aware event sorting (`sort_events_for_viewer`)
 //!   reusing [`crate::pagination::EventVisibility`].
+//! - Canonicalization and deduplication (`canonicalize_and_dedup_events`).
+//! - Sorted assertions (`is_events_sorted`, `is_statuses_sorted`).
 
 use core::cmp::Ordering;
-use soroban_sdk::{contracttype, Address, Env, Vec};
+use soroban_sdk::{contracttype, Address, Env, Symbol, Vec};
 
 use crate::auth::require_admin;
 use crate::errors::Error;
@@ -91,6 +94,21 @@ pub struct SortableEvent {
     pub visibility: EventVisibility,
 }
 
+/// A structured component health or operational status digest (#492).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SortableStatus {
+    pub component_id: Symbol,
+    /// 1 = Critical, 2 = High, 3 = Medium, 4 = Low, 5 = Operational
+    pub severity_rank: u32,
+    pub last_heartbeat: u64,
+    pub is_healthy: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Comparators
+// ---------------------------------------------------------------------------
+
 /// Total-order comparator for [`SortableRecord`].
 pub fn compare_records(a: &SortableRecord, b: &SortableRecord, policy: SortPolicy) -> Ordering {
     let primary = match policy {
@@ -153,10 +171,36 @@ pub fn compare_events(a: &SortableEvent, b: &SortableEvent, policy: SortPolicy) 
         .then_with(|| a.event_id.cmp(&b.event_id))
 }
 
-/// Sort a bounded vector of mixed-status [`SortableRecord`]s deterministically.
-///
-/// - Rejects batches exceeding [`MAX_SORT_ITEMS`] with [`Error::InvalidArgument`].
-/// - When `strict_unique` is `true`, rejects duplicate `id`s with [`Error::InvalidArgument`].
+/// Total-order comparator for [`SortableStatus`] (#492).
+pub fn compare_statuses(a: &SortableStatus, b: &SortableStatus, policy: SortPolicy) -> Ordering {
+    match policy {
+        SortPolicy::StatusPriorityFirst => a
+            .severity_rank
+            .cmp(&b.severity_rank)
+            .then_with(|| b.last_heartbeat.cmp(&a.last_heartbeat))
+            .then_with(|| a.is_healthy.cmp(&b.is_healthy)),
+        SortPolicy::TimestampAsc => a
+            .last_heartbeat
+            .cmp(&b.last_heartbeat)
+            .then_with(|| a.severity_rank.cmp(&b.severity_rank))
+            .then_with(|| a.is_healthy.cmp(&b.is_healthy)),
+        SortPolicy::TimestampDesc => b
+            .last_heartbeat
+            .cmp(&a.last_heartbeat)
+            .then_with(|| a.severity_rank.cmp(&b.severity_rank))
+            .then_with(|| a.is_healthy.cmp(&b.is_healthy)),
+        SortPolicy::LedgerSeqAsc => a
+            .severity_rank
+            .cmp(&b.severity_rank)
+            .then_with(|| a.last_heartbeat.cmp(&b.last_heartbeat)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sorting Operations
+// ---------------------------------------------------------------------------
+
+/// Sort a vector of [`SortableRecord`]s deterministically according to `policy`.
 pub fn sort_records(
     env: &Env,
     records: &Vec<SortableRecord>,
@@ -192,25 +236,56 @@ pub fn sort_records(
     }
 
     if strict_unique && len > 1 {
-        let mut k = 1u32;
-        while k < len {
-            let a = out.get(k - 1).unwrap();
-            let b = out.get(k).unwrap();
-            if a.id == b.id {
+        for idx in 1..len {
+            let prev = out.get(idx - 1).unwrap();
+            let curr = out.get(idx).unwrap();
+            if prev.id == curr.id {
                 return Err(Error::InvalidArgument);
             }
-            k += 1;
         }
     }
 
     Ok(out)
 }
 
-/// Filter by authorization/visibility and deterministically sort [`SortableEvent`]s.
-///
-/// - If `include_maintainer_only` is `true`, verifies `caller` is admin via [`require_admin`],
-///   returning [`Error::Unauthorized`] otherwise.
-/// - If `include_maintainer_only` is `false`, `MaintainerOnly` events are excluded.
+/// Sort a vector of [`SortableEvent`]s deterministically (#492).
+pub fn sort_events(
+    env: &Env,
+    events: &Vec<SortableEvent>,
+    policy: SortPolicy,
+) -> Result<Vec<SortableEvent>, Error> {
+    if events.len() > MAX_SORT_ITEMS {
+        return Err(Error::InvalidArgument);
+    }
+
+    let mut out = Vec::new(env);
+    for item in events.iter() {
+        out.push_back(item);
+    }
+
+    let len = out.len();
+    let mut i = 1u32;
+    while i < len {
+        let key = out.get(i).unwrap();
+        let mut j = i;
+        while j > 0 {
+            let prev = out.get(j - 1).unwrap();
+            if compare_events(&prev, &key, policy) == Ordering::Greater {
+                out.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        out.set(j, key);
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+/// Sort a vector of [`SortableEvent`]s according to `policy`, filtering out
+/// `MaintainerOnly` events unless `caller` is admin and `include_maintainer_only` is true.
 pub fn sort_events_for_viewer(
     env: &Env,
     caller: &Address,
@@ -253,12 +328,120 @@ pub fn sort_events_for_viewer(
     Ok(out)
 }
 
+/// Sort a vector of [`SortableStatus`] component digests deterministically (#492).
+pub fn sort_statuses(
+    env: &Env,
+    statuses: &Vec<SortableStatus>,
+    policy: SortPolicy,
+) -> Result<Vec<SortableStatus>, Error> {
+    if statuses.len() > MAX_SORT_ITEMS {
+        return Err(Error::InvalidArgument);
+    }
+
+    let mut out = Vec::new(env);
+    for item in statuses.iter() {
+        out.push_back(item);
+    }
+
+    let len = out.len();
+    let mut i = 1u32;
+    while i < len {
+        let key = out.get(i).unwrap();
+        let mut j = i;
+        while j > 0 {
+            let prev = out.get(j - 1).unwrap();
+            if compare_statuses(&prev, &key, policy) == Ordering::Greater {
+                out.set(j, prev);
+                j -= 1;
+            } else {
+                break;
+            }
+        }
+        out.set(j, key);
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+/// Verifies whether an event vector is already deterministically sorted.
+pub fn is_events_sorted(events: &Vec<SortableEvent>, policy: SortPolicy) -> bool {
+    let len = events.len();
+    if len <= 1 {
+        return true;
+    }
+    for i in 1..len {
+        let prev = events.get(i - 1).unwrap();
+        let curr = events.get(i).unwrap();
+        if compare_events(&prev, &curr, policy) == Ordering::Greater {
+            return false;
+        }
+    }
+    true
+}
+
+/// Verifies whether a status vector is already deterministically sorted.
+pub fn is_statuses_sorted(statuses: &Vec<SortableStatus>, policy: SortPolicy) -> bool {
+    let len = statuses.len();
+    if len <= 1 {
+        return true;
+    }
+    for i in 1..len {
+        let prev = statuses.get(i - 1).unwrap();
+        let curr = statuses.get(i).unwrap();
+        if compare_statuses(&prev, &curr, policy) == Ordering::Greater {
+            return false;
+        }
+    }
+    true
+}
+
+/// Sorts events and strips exact duplicates (identical event_id, status, timestamp, ledger_seq).
+pub fn canonicalize_and_dedup_events(
+    env: &Env,
+    events: &Vec<SortableEvent>,
+    policy: SortPolicy,
+) -> Result<Vec<SortableEvent>, Error> {
+    let sorted = sort_events(env, events, policy)?;
+    let len = sorted.len();
+    if len <= 1 {
+        return Ok(sorted);
+    }
+
+    let mut deduped = Vec::new(env);
+    let first = sorted.get(0).unwrap();
+    deduped.push_back(first.clone());
+    let mut last = first;
+
+    for i in 1..len {
+        let curr = sorted.get(i).unwrap();
+        let is_dup = curr.event_id == last.event_id
+            && curr.status == last.status
+            && curr.timestamp == last.timestamp
+            && curr.ledger_seq == last.ledger_seq;
+
+        if !is_dup {
+            deduped.push_back(curr.clone());
+            last = curr;
+        }
+    }
+
+    Ok(deduped)
+}
+
+// ---------------------------------------------------------------------------
+// Unit Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::auth::initialize_admin;
-    use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::{contract, contractimpl};
+    use soroban_sdk::{
+        contract, contractimpl, symbol_short,
+        testutils::Address as _,
+        Address, Env,
+    };
 
     #[contract]
     pub struct MockContract;
@@ -391,27 +574,99 @@ mod tests {
 
         env.as_contract(&contract_id, || {
             initialize_admin(&env, &admin).unwrap();
+        });
 
-            // Non-admin requesting MaintainerOnly events is rejected.
+        // Non-admin requesting MaintainerOnly events is rejected.
+        env.as_contract(&contract_id, || {
             assert_eq!(
                 sort_events_for_viewer(&env, &user, &events, SortPolicy::TimestampAsc, true),
                 Err(Error::Unauthorized)
             );
+        });
 
-            // Non-admin with include_maintainer_only = false gets only user-facing events, sorted.
+        // Non-admin with include_maintainer_only = false gets only user-facing events, sorted.
+        env.as_contract(&contract_id, || {
             let user_view =
                 sort_events_for_viewer(&env, &user, &events, SortPolicy::TimestampAsc, false)
                     .unwrap();
             assert_eq!(user_view.len(), 2);
             assert_eq!(user_view.get(0).unwrap().event_id, 12);
             assert_eq!(user_view.get(1).unwrap().event_id, 10);
+        });
 
-            // Admin with include_maintainer_only = true sees all 3 in canonical order.
+        // Admin with include_maintainer_only = true sees all 3 in canonical order.
+        env.as_contract(&contract_id, || {
             let admin_view =
                 sort_events_for_viewer(&env, &admin, &events, SortPolicy::TimestampAsc, true)
                     .unwrap();
             assert_eq!(admin_view.len(), 3);
             assert_eq!(admin_view.get(0).unwrap().event_id, 11);
         });
+    }
+
+    #[test]
+    fn test_direct_event_sorting_and_assertions() {
+        let env = Env::default();
+        let mut events = Vec::new(&env);
+
+        events.push_back(ev(3, RecordStatus::Active, 300, 3, 0, EventVisibility::Public));
+        events.push_back(ev(1, RecordStatus::Active, 100, 1, 0, EventVisibility::Public));
+        events.push_back(ev(2, RecordStatus::Active, 200, 2, 0, EventVisibility::Public));
+
+        assert!(!is_events_sorted(&events, SortPolicy::TimestampAsc));
+
+        let sorted = sort_events(&env, &events, SortPolicy::TimestampAsc).unwrap();
+        assert_eq!(sorted.get(0).unwrap().event_id, 1);
+        assert_eq!(sorted.get(1).unwrap().event_id, 2);
+        assert_eq!(sorted.get(2).unwrap().event_id, 3);
+        assert!(is_events_sorted(&sorted, SortPolicy::TimestampAsc));
+    }
+
+    #[test]
+    fn test_canonicalize_and_dedup_events() {
+        let env = Env::default();
+        let mut events = Vec::new(&env);
+
+        events.push_back(ev(1, RecordStatus::Pending, 100, 1, 0, EventVisibility::Public));
+        events.push_back(ev(2, RecordStatus::Active, 200, 2, 0, EventVisibility::Public));
+        events.push_back(ev(1, RecordStatus::Pending, 100, 1, 0, EventVisibility::Public)); // duplicate
+
+        let deduped = canonicalize_and_dedup_events(&env, &events, SortPolicy::TimestampAsc).unwrap();
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped.get(0).unwrap().event_id, 1);
+        assert_eq!(deduped.get(1).unwrap().event_id, 2);
+    }
+
+    #[test]
+    fn test_status_list_sorting_and_priority() {
+        let env = Env::default();
+        let mut statuses = Vec::new(&env);
+
+        statuses.push_back(SortableStatus {
+            component_id: symbol_short!("relayer"),
+            severity_rank: 5,
+            last_heartbeat: 100,
+            is_healthy: true,
+        });
+        statuses.push_back(SortableStatus {
+            component_id: symbol_short!("oracle"),
+            severity_rank: 1,
+            last_heartbeat: 90,
+            is_healthy: false,
+        });
+        statuses.push_back(SortableStatus {
+            component_id: symbol_short!("treasury"),
+            severity_rank: 2,
+            last_heartbeat: 95,
+            is_healthy: false,
+        });
+
+        assert!(!is_statuses_sorted(&statuses, SortPolicy::StatusPriorityFirst));
+
+        let sorted = sort_statuses(&env, &statuses, SortPolicy::StatusPriorityFirst).unwrap();
+        assert_eq!(sorted.get(0).unwrap().component_id, symbol_short!("oracle"));
+        assert_eq!(sorted.get(1).unwrap().component_id, symbol_short!("treasury"));
+        assert_eq!(sorted.get(2).unwrap().component_id, symbol_short!("relayer"));
+        assert!(is_statuses_sorted(&sorted, SortPolicy::StatusPriorityFirst));
     }
 }
